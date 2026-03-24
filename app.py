@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import os
 import re
 from pathlib import Path
@@ -13,6 +14,7 @@ import pandas as pd
 import pdfplumber
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
@@ -236,7 +238,12 @@ def inject_theme_css() -> None:
 
 
 def get_icon_path() -> Path:
-    return Path(__file__).resolve().parent / "assets" / "aava-icon-svg.svg"
+    """Sidebar + browser tab logo: Ascendion JPEG if present, else legacy SVG."""
+    assets = Path(__file__).resolve().parent / "assets"
+    jpeg = assets / "ascendion.jpeg"
+    if jpeg.is_file():
+        return jpeg
+    return assets / "aava-icon-svg.svg"
 
 
 def list_pdf_files(folder: str) -> list[Path]:
@@ -1007,12 +1014,53 @@ CLOUD_EXTRACT_SYSTEM = (
 )
 
 
-def pdf_iframe_html(pdf_bytes: bytes, height: int = 560) -> str:
-    b64 = base64.b64encode(pdf_bytes).decode("ascii")
-    return (
-        f'<iframe class="pdf-frame" src="data:application/pdf;base64,{b64}" '
-        f'width="100%" height="{height}" style="border:0;display:block;"></iframe>'
+# Browsers (Chrome/Edge) often block PDFs in iframes when src is data: — especially on Streamlit Cloud.
+MAX_INLINE_PDF_PREVIEW_BYTES = 14 * 1024 * 1024
+
+
+def render_pdf_preview_panel(pdf_bytes: bytes, height: int, download_stem: str) -> None:
+    """
+    Show PDF preview via blob URL inside components.html (more reliable than data: iframes in st.markdown).
+    Always offer a direct download for blocked-preview cases.
+    """
+    st.download_button(
+        "Download PDF",
+        data=pdf_bytes,
+        file_name=f"{download_stem}.pdf",
+        mime="application/pdf",
+        key="download_original_pdf",
     )
+    st.caption(
+        "If preview stays blank or says the page was blocked, use **Download PDF** — "
+        "Chrome/Edge restrict embedded PDFs on some hosts; opening the downloaded file works everywhere."
+    )
+    if len(pdf_bytes) > MAX_INLINE_PDF_PREVIEW_BYTES:
+        st.info("This PDF is large; inline preview is skipped. Use **Download PDF**.")
+        return
+    b64 = base64.b64encode(pdf_bytes).decode("ascii")
+    b64_js = json.dumps(b64)
+    html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"/>
+<style>html,body,{{margin:0;padding:0;height:100%;overflow:hidden;background:#fafafa;}}
+iframe{{width:100%;height:100%;border:0;display:block;}}</style></head><body>
+<iframe id="pdfv" title="PDF preview"></iframe>
+<script>
+(function() {{
+  const b64 = {b64_js};
+  try {{
+    const raw = atob(b64);
+    const n = raw.length;
+    const u8 = new Uint8Array(n);
+    for (let i = 0; i < n; i++) u8[i] = raw.charCodeAt(i);
+    const blob = new Blob([u8], {{ type: "application/pdf" }});
+    const url = URL.createObjectURL(blob);
+    document.getElementById("pdfv").src = url + "#toolbar=1";
+  }} catch (e) {{
+    document.body.innerHTML = "<p style=\\"padding:12px;font:14px system-ui\\">Preview unavailable in this browser.</p>";
+  }}
+}})();
+</script></body></html>"""
+    components.html(html, height=height, scrolling=False)
 
 
 def main() -> None:
@@ -1159,8 +1207,9 @@ def main() -> None:
         st.markdown('<div class="aava-panel">', unsafe_allow_html=True)
         st.markdown('<p class="aava-panel-title">Original PDF</p>', unsafe_allow_html=True)
         st.markdown('<div class="aava-panel-inner">', unsafe_allow_html=True)
-        st.markdown(f'<div class="pdf-frame-wrap">{pdf_iframe_html(pdf_bytes)}</div>', unsafe_allow_html=True)
-        st.markdown("</div></div>", unsafe_allow_html=True)
+        st.markdown('<div class="pdf-frame-wrap">', unsafe_allow_html=True)
+        render_pdf_preview_panel(pdf_bytes, height=560, download_stem=download_stem)
+        st.markdown("</div></div></div>", unsafe_allow_html=True)
         st.caption(pdf_caption)
 
     with right:
