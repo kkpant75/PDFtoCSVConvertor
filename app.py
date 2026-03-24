@@ -3,9 +3,7 @@ Streamlit: browse PDFs from PALANTIR_FOLDER, structured table extract + optional
 """
 from __future__ import annotations
 
-import base64
 import io
-import json
 import os
 import re
 from pathlib import Path
@@ -14,7 +12,6 @@ import pandas as pd
 import pdfplumber
 import requests
 import streamlit as st
-import streamlit.components.v1 as components
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
@@ -208,12 +205,10 @@ def inject_theme_css() -> None:
             background: #fff !important;
             color: {t["brand_primary"]} !important;
         }}
-        .pdf-frame-wrap {{
-            border: 1px solid {t["border_card"]};
-            border-radius: 12px;
-            overflow: hidden;
-            background: #fafafa;
-            min-height: 520px;
+        /* Crisp downscaled PNG previews (high-DPI source) */
+        [data-testid="stImage"] img {{
+            max-width: 100%;
+            height: auto;
         }}
         .aava-icon-row {{ display: flex; align-items: center; gap: 12px; margin-bottom: 0.75rem; }}
         .aava-icon-row img {{ width: 56px !important; height: auto; }}
@@ -1014,14 +1009,38 @@ CLOUD_EXTRACT_SYSTEM = (
 )
 
 
-# Browsers (Chrome/Edge) often block PDFs in iframes when src is data: — especially on Streamlit Cloud.
-MAX_INLINE_PDF_PREVIEW_BYTES = 14 * 1024 * 1024
-
-
-def render_pdf_preview_panel(pdf_bytes: bytes, height: int, download_stem: str) -> None:
+def pdf_first_page_png_bytes(pdf_bytes: bytes, resolution: int = 200) -> tuple[bytes | None, str | None]:
     """
-    Show PDF preview via blob URL inside components.html (more reliable than data: iframes in st.markdown).
-    Always offer a direct download for blocked-preview cases.
+    Rasterize page 1 with pdfplumber/pypdfium2 — higher resolution = sharper on screen when scaled.
+    """
+    last_err: str | None = None
+    for res in (resolution, 120):
+        try:
+            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                if not pdf.pages:
+                    return None, "PDF has no pages"
+                page_img = pdf.pages[0].to_image(resolution=res, antialias=True)
+                buf = io.BytesIO()
+                page_img.original.save(buf, format="PNG", compress_level=2)
+                return buf.getvalue(), None
+        except Exception as e:
+            last_err = str(e)
+            continue
+    return None, last_err
+
+
+def _panel_container():
+    """Bordered container on Streamlit ≥1.33; plain container on older versions."""
+    try:
+        return st.container(border=True)
+    except TypeError:
+        return st.container()
+
+
+def render_pdf_preview_panel(pdf_bytes: bytes, download_stem: str) -> None:
+    """
+    Show page 1 as PNG via st.image (works locally and on Streamlit Cloud).
+    Do not wrap this in raw HTML <div> blocks — Streamlit widgets are not nested inside st.markdown HTML.
     """
     st.download_button(
         "Download PDF",
@@ -1031,36 +1050,16 @@ def render_pdf_preview_panel(pdf_bytes: bytes, height: int, download_stem: str) 
         key="download_original_pdf",
     )
     st.caption(
-        "If preview stays blank or says the page was blocked, use **Download PDF** — "
-        "Chrome/Edge restrict embedded PDFs on some hosts; opening the downloaded file works everywhere."
+        "Preview: **page 1** at high resolution. Download the PDF for all pages and native zoom."
     )
-    if len(pdf_bytes) > MAX_INLINE_PDF_PREVIEW_BYTES:
-        st.info("This PDF is large; inline preview is skipped. Use **Download PDF**.")
-        return
-    b64 = base64.b64encode(pdf_bytes).decode("ascii")
-    b64_js = json.dumps(b64)
-    html = f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"/>
-<style>html,body,{{margin:0;padding:0;height:100%;overflow:hidden;background:#fafafa;}}
-iframe{{width:100%;height:100%;border:0;display:block;}}</style></head><body>
-<iframe id="pdfv" title="PDF preview"></iframe>
-<script>
-(function() {{
-  const b64 = {b64_js};
-  try {{
-    const raw = atob(b64);
-    const n = raw.length;
-    const u8 = new Uint8Array(n);
-    for (let i = 0; i < n; i++) u8[i] = raw.charCodeAt(i);
-    const blob = new Blob([u8], {{ type: "application/pdf" }});
-    const url = URL.createObjectURL(blob);
-    document.getElementById("pdfv").src = url + "#toolbar=1";
-  }} catch (e) {{
-    document.body.innerHTML = "<p style=\\"padding:12px;font:14px system-ui\\">Preview unavailable in this browser.</p>";
-  }}
-}})();
-</script></body></html>"""
-    components.html(html, height=height, scrolling=False)
+    png, err = pdf_first_page_png_bytes(pdf_bytes)
+    if png:
+        st.image(png, use_container_width=True, output_format="PNG")
+    else:
+        st.warning("Could not render a page preview. Use **Download PDF**.")
+        if err:
+            with st.expander("Why preview failed"):
+                st.code(err, language="text")
 
 
 def main() -> None:
@@ -1086,15 +1085,12 @@ def main() -> None:
     with st.sidebar:
         if icon.exists():
             st.image(str(icon), use_container_width=True)
-        st.caption("Configured folder")
-        st.text(palantir if palantir_path.is_dir() else f"(not found)\n{palantir}")
-        st.divider()
         st.caption(
             "PDFs in **another folder**? On the main page use **Select PDF from any folder** — "
             "it opens your system file browser so you can pick any PDF on this computer."
         )
         if pdfs:
-            st.caption(f"{len(pdfs)} PDF(s) listed from the folder above — or browse elsewhere on the main page.")
+            st.caption(f"{len(pdfs)} PDF(s) available from the list on the main page.")
         st.divider()
         st.caption("Cloud extraction")
         st.text_input(
@@ -1204,34 +1200,29 @@ def main() -> None:
 
     left, right = st.columns(2, gap="medium")
     with left:
-        st.markdown('<div class="aava-panel">', unsafe_allow_html=True)
-        st.markdown('<p class="aava-panel-title">Original PDF</p>', unsafe_allow_html=True)
-        st.markdown('<div class="aava-panel-inner">', unsafe_allow_html=True)
-        st.markdown('<div class="pdf-frame-wrap">', unsafe_allow_html=True)
-        render_pdf_preview_panel(pdf_bytes, height=560, download_stem=download_stem)
-        st.markdown("</div></div></div>", unsafe_allow_html=True)
-        st.caption(pdf_caption)
+        with _panel_container():
+            st.markdown('<p class="aava-panel-title">Original PDF</p>', unsafe_allow_html=True)
+            render_pdf_preview_panel(pdf_bytes, download_stem=download_stem)
+            st.caption(pdf_caption)
 
     with right:
-        st.markdown('<div class="aava-panel">', unsafe_allow_html=True)
-        st.markdown('<p class="aava-panel-title">Extracted CSV</p>', unsafe_allow_html=True)
-        st.markdown('<div class="aava-panel-inner">', unsafe_allow_html=True)
-        df = st.session_state.get("csv_df")
-        if df is not None and isinstance(df, pd.DataFrame) and not df.empty:
-            title = (st.session_state.get("csv_title") or "").strip()
-            if title:
-                st.caption(f"Report location (CSV line 1): {title}")
-            st.dataframe(df, use_container_width=True, height=520)
-            csv_out = csv_with_report_title_line(df, title)
-            st.download_button(
-                "Download CSV",
-                data=csv_out.encode("utf-8"),
-                file_name=download_stem + "_extracted.csv",
-                mime="text/csv",
-            )
-        else:
-            st.info("Run Convert PDF → CSV to populate this panel.")
-        st.markdown("</div></div>", unsafe_allow_html=True)
+        with _panel_container():
+            st.markdown('<p class="aava-panel-title">Extracted CSV</p>', unsafe_allow_html=True)
+            df = st.session_state.get("csv_df")
+            if df is not None and isinstance(df, pd.DataFrame) and not df.empty:
+                title = (st.session_state.get("csv_title") or "").strip()
+                if title:
+                    st.caption(f"Report location (CSV line 1): {title}")
+                st.dataframe(df, use_container_width=True, height=560)
+                csv_out = csv_with_report_title_line(df, title)
+                st.download_button(
+                    "Download CSV",
+                    data=csv_out.encode("utf-8"),
+                    file_name=download_stem + "_extracted.csv",
+                    mime="text/csv",
+                )
+            else:
+                st.info("Run Convert PDF → CSV to populate this panel.")
 
 
 if __name__ == "__main__":
